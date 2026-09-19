@@ -519,3 +519,353 @@ def test_summarize_running_jobs_are_counted():
 def test_overnight_label_switches_after_1800():
     assert api.overnight_label(_dt("2026-09-19T17:59:00"), TZ) == "Last night"
     assert api.overnight_label(_dt("2026-09-19T18:00:00"), TZ) == "Tonight"
+
+
+def _write_jobs(home: Path, jobs: list) -> None:
+    (home / "config.yaml").write_text("x: 1\n", encoding="utf-8")
+    cron = home / "cron"
+    cron.mkdir(parents=True, exist_ok=True)
+    (cron / "jobs.json").write_text(json.dumps({"jobs": jobs}), encoding="utf-8")
+
+
+def _write_execution(home: Path, *, exe_id: str, job_id: str, status: str,
+                     claimed_at: str, started_at: str, finished_at, error=None) -> None:
+    db = home / "cron" / "executions.db"
+    conn = sqlite3.connect(db)
+    conn.execute(
+        """CREATE TABLE IF NOT EXISTS executions (
+            id TEXT PRIMARY KEY, job_id TEXT, source TEXT, process_id TEXT,
+            pid INTEGER, status TEXT, claimed_at TEXT, started_at TEXT,
+            finished_at TEXT, error TEXT
+        )"""
+    )
+    conn.execute(
+        "INSERT INTO executions VALUES (?,?,?,?,?,?,?,?,?,?)",
+        (exe_id, job_id, "builtin", "p", 1, status, claimed_at, started_at, finished_at, error),
+    )
+    conn.commit()
+    conn.close()
+
+
+def test_normalize_cost_includes_cache_tokens():
+    tokens, usd = api.normalize_cost({
+        "input_tokens": 10,
+        "output_tokens": 5,
+        "cache_read_tokens": 100,
+        "cache_write_tokens": 20,
+    })
+    assert tokens == 135
+    assert usd is None
+
+
+def test_normalize_cost_cache_only_counts():
+    tokens, usd = api.normalize_cost({"cache_read_tokens": 40, "cache_write_tokens": 2})
+    assert tokens == 42
+    assert usd is None
+
+
+def test_hung_running_started_before_window_is_kept():
+    start, end = api.overnight_window(_dt("2026-09-19T10:00:00"), TZ)
+    runs = [
+        {
+            "job_id": "hung",
+            "started_at": "2026-09-18T17:00:00-07:00",
+            "finished_at": None,
+            "status": "running",
+        },
+        {
+            "job_id": "claimed",
+            "started_at": "2026-09-18T16:45:00-07:00",
+            "finished_at": None,
+            "status": "claimed",
+        },
+        {
+            "job_id": "daytime_done",
+            "started_at": "2026-09-18T17:00:00-07:00",
+            "finished_at": "2026-09-18T17:30:00-07:00",
+            "status": "completed",
+        },
+        {
+            "job_id": "after_window",
+            "started_at": "2026-09-19T09:00:00-07:00",
+            "finished_at": None,
+            "status": "running",
+        },
+    ]
+    kept = api.filter_runs_in_window(runs, start, end, default_tz=TZ)
+    assert {r["job_id"] for r in kept} == {"hung", "claimed"}
+
+
+def test_in_window_running_is_kept_and_summarized():
+    start, end = api.overnight_window(_dt("2026-09-19T10:00:00"), TZ)
+    runs = [
+        {
+            "job_id": "overnight_hung",
+            "started_at": "2026-09-18T21:00:00-07:00",
+            "finished_at": None,
+            "status": "running",
+            "usd": None,
+        }
+    ]
+    kept = api.filter_runs_in_window(runs, start, end, default_tz=TZ)
+    assert [r["job_id"] for r in kept] == ["overnight_hung"]
+    summary = api.summarize_runs(kept)
+    assert summary["running"] == 1
+    assert summary["failed"] == 0
+    assert summary["runs"] == 1
+
+
+def test_last_run_at_skipped_when_executions_exist(tmp_path: Path):
+    job_id = "a1b2c3d4e5f6"
+    _write_jobs(tmp_path, [{
+        "id": job_id,
+        "name": "Briefing",
+        "schedule_display": "0 2 * * *",
+        "last_run_at": "2026-09-18T23:00:00-07:00",
+        "last_status": "ok",
+    }])
+    _write_execution(
+        tmp_path,
+        exe_id="exe-fail",
+        job_id=job_id,
+        status="failed",
+        claimed_at="2026-09-18T21:00:00-07:00",
+        started_at="2026-09-18T21:00:01-07:00",
+        finished_at="2026-09-18T21:00:40-07:00",
+        error="boom",
+    )
+    start, end = api.overnight_window(_dt("2026-09-19T10:00:00"), TZ)
+    runs = api.filter_runs_in_window(
+        api.collect_home_runs(tmp_path, default_tz=TZ, profile="default"),
+        start, end, default_tz=TZ,
+    )
+    assert len(runs) == 1
+    assert runs[0]["status"] == "failed"
+    assert runs[0]["error"] and "boom" in runs[0]["error"]
+    assert not any(str(r.get("id") or "").startswith("last:") for r in runs)
+
+
+def test_last_run_at_used_when_no_other_history(tmp_path: Path):
+    job_id = "a1b2c3d4e5f6"
+    _write_jobs(tmp_path, [{
+        "id": job_id,
+        "name": "Briefing",
+        "schedule_display": "0 2 * * *",
+        "last_run_at": "2026-09-18T22:00:00-07:00",
+        "last_status": "failed",
+        "last_error": "delivery failed",
+    }])
+    start, end = api.overnight_window(_dt("2026-09-19T10:00:00"), TZ)
+    runs = api.filter_runs_in_window(
+        api.collect_home_runs(tmp_path, default_tz=TZ, profile="default"),
+        start, end, default_tz=TZ,
+    )
+    assert len(runs) == 1
+    assert runs[0]["status"] == "failed"
+    assert runs[0]["name"] == "Briefing"
+
+
+def test_usage_audit_without_error_does_not_paint_completed(tmp_path: Path):
+    job_id = "a1b2c3d4e5f6"
+    _write_jobs(tmp_path, [{"id": job_id, "name": "Briefing"}])
+    (tmp_path / "cron" / "usage_audit.jsonl").write_text(
+        json.dumps({
+            "ts": "2026-09-19T05:00:00.000Z",
+            "job_id": job_id,
+            "fire_id": "fire-tokens",
+            "prompt_tokens": 80,
+            "completion_tokens": 20,
+            "total_tokens": 100,
+            "error": None,
+        }) + "\n",
+        encoding="utf-8",
+    )
+    start, end = api.overnight_window(_dt("2026-09-19T10:00:00"), TZ)
+    runs = api.filter_runs_in_window(
+        api.collect_home_runs(tmp_path, default_tz=TZ, profile="default"),
+        start, end, default_tz=TZ,
+    )
+    assert len(runs) == 1
+    assert runs[0]["status"] is None
+    assert runs[0]["tokens"] == 100
+    assert runs[0]["usd"] is None
+
+
+def test_usage_audit_merges_tokens_without_overwriting_completed(tmp_path: Path):
+    job_id = "a1b2c3d4e5f6"
+    _write_jobs(tmp_path, [{"id": job_id, "name": "Briefing"}])
+    _write_execution(
+        tmp_path,
+        exe_id="exe-ok",
+        job_id=job_id,
+        status="completed",
+        claimed_at="2026-09-18T21:00:00-07:00",
+        started_at="2026-09-18T21:00:00-07:00",
+        finished_at="2026-09-18T21:00:40-07:00",
+    )
+    (tmp_path / "cron" / "usage_audit.jsonl").write_text(
+        json.dumps({
+            "ts": "2026-09-19T04:00:40.100Z",
+            "job_id": job_id,
+            "fire_id": "fire-ok",
+            "total_tokens": 100,
+            "error": None,
+        }) + "\n",
+        encoding="utf-8",
+    )
+    start, end = api.overnight_window(_dt("2026-09-19T10:00:00"), TZ)
+    runs = api.filter_runs_in_window(
+        api.collect_home_runs(tmp_path, default_tz=TZ, profile="default"),
+        start, end, default_tz=TZ,
+    )
+    assert len(runs) == 1
+    assert runs[0]["status"] == "completed"
+    assert runs[0]["tokens"] == 100
+
+
+def test_merge_matches_audit_to_finished_at_not_only_started(tmp_path: Path):
+    job_id = "a1b2c3d4e5f6"
+    _write_jobs(tmp_path, [{"id": job_id, "name": "Long briefing"}])
+    _write_execution(
+        tmp_path,
+        exe_id="exe-long",
+        job_id=job_id,
+        status="completed",
+        claimed_at="2026-09-18T21:00:00-07:00",
+        started_at="2026-09-18T21:00:00-07:00",
+        finished_at="2026-09-18T21:04:00-07:00",
+    )
+    (tmp_path / "cron" / "usage_audit.jsonl").write_text(
+        json.dumps({
+            "ts": "2026-09-19T04:04:00.000Z",
+            "job_id": job_id,
+            "fire_id": "fire-long",
+            "total_tokens": 250,
+            "error": None,
+        }) + "\n",
+        encoding="utf-8",
+    )
+    start, end = api.overnight_window(_dt("2026-09-19T10:00:00"), TZ)
+    runs = api.filter_runs_in_window(
+        api.collect_home_runs(tmp_path, default_tz=TZ, profile="default"),
+        start, end, default_tz=TZ,
+    )
+    assert len(runs) == 1
+    assert runs[0]["tokens"] == 250
+    assert runs[0]["status"] == "completed"
+
+
+def test_night_payload_labels_profiles_when_unioning_homes(tmp_path: Path):
+    default = tmp_path
+    kid = tmp_path / "profiles" / "kid"
+    kid.mkdir(parents=True)
+    _write_jobs(default, [{
+        "id": "aaaaaaaaaaaa",
+        "name": "Parent briefing",
+        "last_run_at": "2026-09-18T22:00:00-07:00",
+        "last_status": "ok",
+    }])
+    _write_jobs(kid, [{
+        "id": "bbbbbbbbbbbb",
+        "name": "Kid ping",
+        "last_run_at": "2026-09-18T22:30:00-07:00",
+        "last_status": "failed",
+        "last_error": "no",
+    }])
+    payload = api.night_payload(
+        root=default, tz_name="America/Los_Angeles", now=_dt("2026-09-19T10:00:00"),
+    )
+    assert "default" in payload["homes"]
+    assert "kid" in payload["homes"]
+    by_name = {r["name"]: r for r in payload["runs"]}
+    assert by_name["Parent briefing"]["profile"] == "default"
+    assert by_name["Kid ping"]["profile"] == "kid"
+    assert by_name["Parent briefing"]["home"]
+    assert by_name["Kid ping"]["home"]
+
+
+def test_runs_carry_profile_on_execution_rows(tmp_path: Path):
+    _write_jobs(tmp_path, [{"id": "a1b2c3d4e5f6", "name": "Briefing"}])
+    _write_execution(
+        tmp_path,
+        exe_id="exe1",
+        job_id="a1b2c3d4e5f6",
+        status="completed",
+        claimed_at="2026-09-18T21:00:00-07:00",
+        started_at="2026-09-18T21:00:00-07:00",
+        finished_at="2026-09-18T21:00:10-07:00",
+    )
+    runs = api.collect_home_runs(tmp_path, default_tz=TZ, profile="forge")
+    assert runs[0]["profile"] == "forge"
+    assert runs[0]["home"] == str(tmp_path)
+
+
+def test_load_cron_sessions_orders_newest_first(tmp_path: Path):
+    (tmp_path / "config.yaml").write_text("x: 1\n", encoding="utf-8")
+    state = tmp_path / "state.db"
+    conn = sqlite3.connect(state)
+    conn.execute(
+        """CREATE TABLE sessions (
+            id TEXT PRIMARY KEY, source TEXT, title TEXT,
+            started_at REAL, ended_at REAL, end_reason TEXT
+        )"""
+    )
+    overnight = datetime(2026, 9, 19, 2, 0, tzinfo=TZ).timestamp()
+    old = datetime(2026, 1, 1, 2, 0, tzinfo=TZ).timestamp()
+    for i in range(500):
+        conn.execute(
+            "INSERT INTO sessions VALUES (?,?,?,?,?,?)",
+            (f"cron_old{i:04d}oldx_{i}", "cron", "Old", old - i, old - i + 1, "ok"),
+        )
+    conn.execute(
+        "INSERT INTO sessions VALUES (?,?,?,?,?,?)",
+        ("cron_abc123abc123_2026-09-19_02-00-00", "cron", "Night", overnight, overnight + 60, "ok"),
+    )
+    conn.commit()
+    conn.close()
+    rows = api.load_cron_sessions(state)
+    assert len(rows) == 500
+    ids = [r["id"] for r in rows]
+    assert "cron_abc123abc123_2026-09-19_02-00-00" in ids
+    assert ids[0] == "cron_abc123abc123_2026-09-19_02-00-00"
+
+
+def test_session_limit_keeps_overnight_run_in_payload(tmp_path: Path):
+    (tmp_path / "config.yaml").write_text("x: 1\n", encoding="utf-8")
+    cron = tmp_path / "cron"
+    cron.mkdir()
+    (cron / "jobs.json").write_text(
+        json.dumps({"jobs": [{"id": "abc123abc123", "name": "Night"}]}),
+        encoding="utf-8",
+    )
+    state = tmp_path / "state.db"
+    conn = sqlite3.connect(state)
+    conn.execute(
+        """CREATE TABLE sessions (
+            id TEXT PRIMARY KEY, source TEXT, title TEXT,
+            started_at REAL, ended_at REAL, end_reason TEXT,
+            input_tokens INTEGER, output_tokens INTEGER,
+            actual_cost_usd REAL, estimated_cost_usd REAL, cost_status TEXT
+        )"""
+    )
+    overnight = datetime(2026, 9, 19, 2, 0, tzinfo=TZ).timestamp()
+    old = datetime(2026, 1, 1, 2, 0, tzinfo=TZ).timestamp()
+    for i in range(500):
+        conn.execute(
+            "INSERT INTO sessions VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+            (f"cron_old{i:04d}oldx_{i}", "cron", "Old", old - i, old - i + 1, "ok",
+             1, 1, None, None, None),
+        )
+    conn.execute(
+        "INSERT INTO sessions VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+        ("cron_abc123abc123_2026-09-19_02-00-00", "cron", "Night",
+         overnight, overnight + 60, "ok", 4, 1, 0.001, None, None),
+    )
+    conn.commit()
+    conn.close()
+    payload = api.night_payload(
+        root=tmp_path, tz_name="America/Los_Angeles", now=_dt("2026-09-19T10:00:00"),
+    )
+    names = [r["name"] for r in payload["runs"]]
+    assert "Night" in names
+

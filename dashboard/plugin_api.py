@@ -521,7 +521,13 @@ def load_cron_sessions(
             )
             if c in cols
         ]
-        sql = f"SELECT {', '.join(want)} FROM sessions WHERE source = ? LIMIT 500"
+        # Newest first so last night is not dropped on a long-lived state.db.
+        # SQLite may store started_at as REAL epoch or ISO text; ORDER BY still
+        # prefers recent rows when the column is homogeneous (Hermes default).
+        sql = (
+            f"SELECT {', '.join(want)} FROM sessions WHERE source = ? "
+            "ORDER BY COALESCE(started_at, ended_at) DESC LIMIT 500"
+        )
         try:
             rows = conn.execute(sql, ("cron",)).fetchall()
         except sqlite3.Error as exc:
@@ -702,6 +708,7 @@ def empty_run() -> Dict[str, Any]:
         "error": None,
         "session_id": None,
         "profile": "",
+        "home": "",
     }
 
 
@@ -732,6 +739,7 @@ def normalize_run(raw: Dict[str, Any], *, default_tz: tzinfo) -> Dict[str, Any]:
     run["error"] = error_snippet(err)
     run["session_id"] = raw.get("session_id") or raw.get("sessionId")
     run["profile"] = str(raw.get("profile") or "")
+    run["home"] = str(raw.get("home") or "")
     run["id"] = str(
         raw.get("execution_id")
         or raw.get("id")
@@ -776,6 +784,7 @@ def collect_home_runs(
             "name": rec.get("name") or job.get("name") or rec.get("job_id"),
             "schedule": rec.get("schedule") or schedule_display(job),
             "profile": profile,
+            "home": home_label,
         }
         raw_rows.append(merged)
 
@@ -784,10 +793,14 @@ def collect_home_runs(
         raw_rows.append({
             **rec,
             "started_at": rec.get("ts"),
-            "status": "failed" if rec.get("error") else "completed",
+            # Token lines are not proof of success. A failed execution that
+            # missed the 120s merge must not inherit "completed" from audit.
+            # Omit status on clean lines so a merged completed ledger stays completed.
+            "status": "failed" if rec.get("error") else None,
             "name": job.get("name") or rec.get("job_id"),
             "schedule": schedule_display(job),
             "profile": profile,
+            "home": home_label,
             "id": rec.get("fire_id"),
         })
 
@@ -822,11 +835,22 @@ def collect_home_runs(
             "status": status,
             "error": sess.get("preview") if status == "failed" else None,
             "profile": profile,
+            "home": home_label,
         })
 
-    # Last-run fallback when a job ran in-window but left no ledger/output/session.
+    # last_run_at is a pointer, not a night's history. Only synthesize a row
+    # when this job left no executions / output / audit / session evidence.
+    jobs_with_history: set[str] = set()
+    for row in raw_rows:
+        jid = str(row.get("job_id") or "")
+        if jid:
+            jobs_with_history.add(jid)
+
     for job in jobs.values():
         if not job.get("last_run_at"):
+            continue
+        job_id = str(job.get("id") or "")
+        if job_id and job_id in jobs_with_history:
             continue
         raw_rows.append({
             "id": f"last:{job.get('id')}:{job.get('last_run_at')}",
@@ -838,6 +862,7 @@ def collect_home_runs(
             "status": job.get("last_status"),
             "error": job.get("last_error") or job.get("last_delivery_error"),
             "profile": profile,
+            "home": home_label,
         })
 
     normalized = [normalize_run(r, default_tz=default_tz) for r in raw_rows]
@@ -849,6 +874,28 @@ def collect_home_runs(
         else:
             merged.append(run)
     return merged
+
+
+def _hung_into_window(
+    run: Dict[str, Any],
+    end: datetime,
+    *,
+    started: Optional[datetime],
+    finished: Optional[datetime],
+) -> bool:
+    """Unfinished claimed/running work that is still on fire during the night.
+
+    A job claimed at 17:00 with no ``finished_at`` is overnight hung work even
+    though ``started_at`` is before 18:00. Finished daytime work is excluded.
+    """
+    status = run.get("status")
+    if status not in ("running", "claimed"):
+        return False
+    if finished is not None:
+        return False
+    if started is None:
+        return True
+    return started < end
 
 
 def filter_runs_in_window(
@@ -863,6 +910,9 @@ def filter_runs_in_window(
         started = parse_datetime(run.get("started_at"), default_tz=default_tz)
         finished = parse_datetime(run.get("finished_at"), default_tz=default_tz)
         if in_window(started, start, end) or in_window(finished, start, end):
+            out.append(run)
+            continue
+        if _hung_into_window(run, end, started=started, finished=finished):
             out.append(run)
     out.sort(
         key=lambda r: parse_datetime(r.get("started_at"), default_tz=default_tz) or datetime.min.replace(tzinfo=timezone.utc),

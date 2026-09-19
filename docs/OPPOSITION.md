@@ -32,6 +32,155 @@ Still open: full P0.5 cost merge/estimate redesign, P0.6 profile isolation, dual
 
 ---
 
+## Round 2 — oppositional re-audit (Honest night / PR #3 shipped)
+
+Re-audit of `ba39f63` (`Honest night: window, timezone, unread vs empty. (#3)`).
+Evidence from `desktop/plugin.js`, `dashboard/plugin_api.py`, `install.sh`,
+`tests/test_plugin_api.py`. I would still not trust this pane for a Spark
+morning. Honest night closed the *calendar* lies (wrong night, wrong zone,
+unread painted as quiet). It did not close the *ledger* lies: two aggregators,
+a last-write pointer standing in for history, cache tokens that exist on disk
+and vanish on RPC, hung work that started at 17:00, and a silent union of every
+local profile.
+
+### What Honest night actually closed
+
+Verified in this tree — not just claimed in the PR body.
+
+| Item | Closed? | Proof |
+|------|---------|--------|
+| **P0.1 unread vs empty** | **Yes**, with a leftover | Present `jobs.json` / `executions.db` / `state.db` I/O or parse failures go in `errors[]`; `night_payload` sets `ok: false`, `read_status: unread\|partial`. Empty successful read stays `ok: true`. Desktop `ErrorState` / banner; `fetchNight` will not prefer unread-empty REST over RPC that listed jobs. **Leftover:** a *successful* empty REST (`ok: true, runs: []`, wrong/empty home) still discards RPC that listed jobs. Fail chip stays off on unread. `/health` is still unconditional ok. Bad `usage_audit.jsonl` lines are still skipped with no error. |
+| **P0.2 18:00–24:00 window** | **Yes**, with a leftover | `overnight_window` / `overnightWindow`: `current >= evening` → today 18:00 → tomorrow 08:00. Tests at 18:00, 18:30, 23:00. **Leftover:** `filter_runs_in_window` still used `started_at` **or** `finished_at` in-window only. A `running`/`claimed` row that started at 17:00 with `finished_at=None` was dropped. Daytime work that *finished* after 18:00 is still included. Exclusive 08:00:00 end unchanged. |
+| **P0.3 Desktop TZ** | **Yes** | `fetchNight` sends `?tz=` from `Intl`. `resolve_tz` honors it. Omitted/invalid → serve local (documented). UTC vs LA bounds tested. Naive ISO / filename-local vs audit-`Z` skew remains a P2. |
+| **P0.4 unknown vs ok (cheap)** | **Partial** | Sessions: missing/unmapped `end_reason` → `unknown`. Unaudited markdown without `(FAILED)` → `unknown`. JS `sessionStatus` matches. **Not closed:** `usage_audit` still set `"status": "completed"` when `error` is null (`collect_home_runs`). A failed execution that missed the 120s merge inherited a green audit ghost. `jobs.json` `last_run_at` still always appended. |
+| **P0.5 partial USD (cheap)** | **Partial** | `summarize_runs` / `summarize` omit `usd` unless every in-window run is billed; UI says `partial (k/n billed)`. **Not closed:** JS `normalizeCost` ignored `cache_read_tokens` / `cache_write_tokens`; Python summed them. JS merge compared `started_at` only; Python compared started **and** finished. `estimated_cost_usd` still copied unlabeled. 120s miss on unfinished long jobs unchanged. |
+| **P0.6 profile mix** | **No** (honesty only, later) | Disk still unions `HERMES_HOME` + `~/.hermes` + `profiles/*`. RPC is still one gateway. Payload already had `homes[]` and `run.profile`; the **pane did not render them**. `normalize_run` dropped `home`. |
+| Status-bar running chip | **Partial** | Chip when `summary.running > 0` **and** `summary.failed == 0`. A night with 1 fail + 1 hung showed only `1 fail`. Failed filter hid `running`/`claimed`. |
+
+### Argue against trusting the pane *again*
+
+Honest night taught the pane to say “could not read” and to look at *tonight*
+after 18:00. The morning glance still cannot answer “what fired, what is still
+on fire, whose home, and what did it cost.”
+
+1. **Two aggregators, two bills.** REST (`plugin_api.py`) and RPC
+   (`loadFromHost`) still independently window, merge, status-map, and cost.
+   Known deltas at `ba39f63`: cache tokens (Python yes, JS no); merge partner
+   search (Python any of `{started_at, finished_at}` within 120s, JS
+   `started_at` only — `mergeRuns` skipped when one side lacked start);
+   `usage_audit` / `executions.db` exist only on disk. Enable-without-remount
+   still lands on RPC. The same overnight can be `$` + cache tokens on disk and
+   tokens-without-cache on RPC, or two rows vs one.
+
+2. **`last_run_at` is still a night’s history.** `collect_home_runs` always
+   appended a synthetic row per job with `last_run_at`. Merge collapsed it when
+   the pointer sat within 120s of a ledger row; a fail-at-21:00 + `last_status=ok`
+   at 23:00 produced a **green extra row** (or, if executions were missing, **only**
+   the ok pointer). RPC `loadFromHost` did the same: `session.list` plus
+   `if (!job.last_run_at) continue`. Multiple overnight ticks became one unless
+   sessions still held each `cron_{id}_*`.
+
+3. **Hung work that began before 18:00 was invisible.** Filter required a
+   timestamp *inside* the window. Claimed at 17:00, still `running` at 03:15,
+   `finished_at=None` → dropped. Counted nowhere. Fail chip off. Failed filter
+   off. Morning: quiet. This is the leftover of P0.2 the window-bounds fix
+   did not touch.
+
+4. **Sessions can drop last night.** `load_cron_sessions` was
+   `WHERE source = ? LIMIT 500` with **no `ORDER BY`**. SQLite may return the
+   oldest cron sessions on a long-lived Spark `state.db`. Last night falls off
+   the page with `ok: true`. Executions use `ORDER BY claimed_at DESC LIMIT 500`
+   (mixed ISO/epoch still sorts wrongly — leftover P1). RPC `session.list`
+   `{ limit: 200 }` sort unspecified.
+
+5. **The union is still silent.** `discover_hermes_homes` concatenates every
+   home. `night_payload["homes"]` was JSON-only. `RunRow` showed name + status
+   badge, never `profile`. Disk = all profiles; RPC = connected gateway. Same
+   sidebar item, no label. Kid-profile error snippets (240 chars) still sit
+   next to parent job names.
+
+6. **Cost can still be understated without inventing a rate.** JS dropped
+   cache tokens. Audit `completed` + missed merge double-counted runs and
+   painted ok. Partial coverage no longer shows a bare `$` (Honest night);
+   estimated USD on a fully-billed night still looks like actual. Long job
+   without `finished_at` vs audit `ts` 180s later is still two rows.
+
+7. **Honest night regressions / unfixed edges.** (a) `unknown` increments
+   `summary.failed` (`_TERMINAL_FAILED`) — the fail chip overstates “fail” for
+   timeouts. (b) Readable-empty REST still wins over RPC with jobs. (c)
+   `GET /night` unhandled exception is still HTTP 200. (d) `defaultEnabled: true`
+   + `install.sh` last-writer JS copy: last `homes[]` checkout overwrote
+   `desktop-plugins/`; `git pull` without re-running install.sh leaves stale JS
+   talking to new Python.
+
+### Remaining after Honest night (before this PR)
+
+**P0**
+
+- JS vs Python cache tokens, merge partner timestamps, `usage_audit` → `completed`.
+- Silent multi-home union in the UI (payload had the fields; the pane did not).
+- `last_run_at` always emitted alongside real history.
+- Hung `running`/`claimed` that started before 18:00 dropped; Failed filter hid
+  in-window hung rows; fail chip hid running when failed > 0.
+- Unordered `sessions LIMIT 500` dropping last night.
+
+**P1**
+
+- Dual aggregator (REST-only rewrite still out of scope). Readable-empty REST
+  hides RPC. RPC `session.list` limit 200.
+- `estimated_cost_usd` unlabeled; 120s merge miss when `finished_at` absent.
+- Enable without remount / stale `desktop-plugins` copy / last-writer JS.
+- `executions.db` mixed ISO/epoch `claimed_at` sort. Session id regex vs
+  hyphenated test fixtures. `ok_silent` → completed. Poll 8s hits RPC+REST.
+- No JS tests. Profile ACL / redaction of `error_snippet`. Profiles without
+  `plugins/` not enabled but still ingested.
+
+**P2**
+
+- Deduplicate window/cost/merge into one fixture; JS consume `/night` only.
+- Unknown as its own chip. Bound secrets in snippets. Refuse output symlinks.
+- Tighten `_HOME_MARKERS` (not `.env` alone). `/night` HTTP 200 on exception;
+  `/health` should open `executions.db`. CI workflow. `defaultEnabled: false`
+  until first successful disk `/night`.
+
+### Addressed in this PR (Round 2 fixes)
+
+Not a mega redesign. Same two aggregators, aligned where they lied.
+
+| Item | What changed |
+|------|----------------|
+| **R2.P0 cache / merge / audit status** | JS `normalizeCost` adds `cache_read_tokens` + `cache_write_tokens` (same as Python). JS `mergeRuns` partners on started **or** finished within 120s (same as `_closest_partner`). Clean `usage_audit` lines no longer set `completed` (status omitted so a merged completed ledger stays completed; audit-only is `n/a`, not ok). |
+| **R2.P0 homes / profile** | `normalize_run` keeps `home` + `profile`. Header lists homes scanned (`Union of homes · …` vs `RPC · connected gateway only`). Each row badges `profile`. RPC payload `homes: ['gateway']`. |
+| **R2.P0 last_run_at** | Synthetic last-run row only when that job has **no** execution / output / audit / session evidence. Same skip in JS `loadFromHost` vs sessions. |
+| **R2.P0 hung claimed/running** | Filter keeps unfinished `running`/`claimed` with `started_at < window end` (17:00 spillover). Failed filter includes them. Status bar can show fail **and** running chips together. |
+| **R2.P0 session order** | `load_cron_sessions` `ORDER BY COALESCE(started_at, ended_at) DESC LIMIT 500`. |
+| **R2.P1 (trivial)** | `install.sh` copies `desktop/plugin.js` from **this** checkout (`SELF`), not last-writer in `homes[]`. |
+
+Tests added for cache tokens, hung spillover, last_run skip vs fallback,
+audit-not-completed, audit merge preserving completed, finished_at merge,
+multi-home profile labels, session newest-first / overnight kept under LIMIT.
+
+### Still open after this PR
+
+- **Profile ACL** — union is now *labeled*, not locked down. Sibling homes still
+  leak names, snippets, cost. RPC vs disk universe split remains.
+- **120s merge miss** — unfinished long job vs audit `ts` 180s later is still
+  two rows. Alignment did not widen the window.
+- **`estimated_cost_usd`** still copied unlabeled when `actual_cost_usd` is
+  missing (no rate table; still looks like a bill).
+- **Readable-empty REST hides RPC** with jobs (wrong home, `ok: true`).
+- **RPC `session.list` limit 200**, executions mixed `claimed_at` types,
+  `GET /night` HTTP 200, `/health` unconditional, no CI, no JS tests.
+- **Stale JS after `git pull`** without re-running `install.sh` (copy source is
+  honest now; freshness is not automatic).
+- **Unknown counted as failed** in the fail chip. Daytime finish-after-18:00
+  still in-window. Exclusive 08:00:00 end.
+
+Do not treat the pane as overnight-ops truth yet. It is less willing to say
+ok when it does not know, and it now says *which home* it scanned.
+
+---
+
 ## 1. Executive opposition
 
 I would not trust this pane for a Spark morning. It can render **“Nothing ran last
@@ -398,3 +547,5 @@ python3 -m pytest tests/ -q
 
 `python -m pytest tests/ -q` → `python: command not found` on this agent image.
 No GitHub Actions workflow in-tree, so merge green does not mean CI green.
+
+Round 2 (this tree): `python3 -m pytest tests/ -q` → **46 passed**.
