@@ -34,17 +34,42 @@ const POLL_MS = 8000
 const $filter = atom('all')
 
 function overnightWindow(now) {
+  // Same bounds as Python overnight_window: after local 18:00 the night that
+  // just started (today 18:00 → tomorrow 08:00); before 18:00 yesterday 18:00 → today 08:00.
   const current = now instanceof Date ? now : new Date()
+  const evening = new Date(current)
+  evening.setHours(18, 0, 0, 0)
   const morning = new Date(current)
   morning.setHours(8, 0, 0, 0)
-  const start = new Date(current)
-  start.setHours(18, 0, 0, 0)
-  start.setDate(start.getDate() - 1)
-  const end = new Date(morning)
-  if (current < morning) {
-    return { start, end }
+  if (current >= evening) {
+    const end = new Date(morning)
+    end.setDate(end.getDate() + 1)
+    return { start: evening, end }
   }
-  return { start, end }
+  const start = new Date(evening)
+  start.setDate(start.getDate() - 1)
+  return { start, end: morning }
+}
+
+function desktopTz() {
+  try {
+    return Intl.DateTimeFormat().resolvedOptions().timeZone || ''
+  } catch {
+    return ''
+  }
+}
+
+function emptySummary() {
+  return { runs: 0, failed: 0, running: 0, tokens: null, usd: null, usd_billed: 0, cost_coverage: 'none' }
+}
+
+function sessionStatus(sess) {
+  const ended = sess.ended_at != null && sess.ended_at !== ''
+  if (!ended) return 'running'
+  const mapped = normalizeStatus(sess.end_reason)
+  if (mapped === 'failed') return 'failed'
+  if (mapped === 'completed') return 'completed'
+  return 'unknown'
 }
 
 function parseTime(value) {
@@ -236,26 +261,44 @@ function mergeRuns(list) {
 
 function summarize(runs) {
   let failed = 0
+  let running = 0
   let tokenSum = 0
   let tokenAny = false
   let usdSum = 0
-  let usdAny = false
+  let usdBilled = 0
   for (const run of runs) {
     if (run.status === 'failed' || run.status === 'unknown' || (!run.status && run.error)) failed += 1
+    if (run.status === 'running' || run.status === 'claimed') running += 1
     if (typeof run.tokens === 'number') {
       tokenSum += run.tokens
       tokenAny = true
     }
     if (typeof run.usd === 'number' && Number.isFinite(run.usd)) {
       usdSum += run.usd
-      usdAny = true
+      usdBilled += 1
     }
   }
+  const n = runs.length
+  let coverage = 'none'
+  let usd = null
+  if (usdBilled === 0) {
+    coverage = 'none'
+    usd = null
+  } else if (usdBilled === n) {
+    coverage = 'complete'
+    usd = usdSum
+  } else {
+    coverage = 'partial'
+    usd = null
+  }
   return {
-    runs: runs.length,
+    runs: n,
     failed,
+    running,
     tokens: tokenAny ? tokenSum : null,
-    usd: usdAny ? usdSum : null,
+    usd,
+    usd_billed: usdBilled,
+    cost_coverage: coverage,
   }
 }
 
@@ -275,19 +318,38 @@ function cronSessionJobId(session) {
   return m ? m[1] : ''
 }
 
+function windowLabel(now) {
+  const current = now instanceof Date ? now : new Date()
+  const evening = new Date(current)
+  evening.setHours(18, 0, 0, 0)
+  return current >= evening ? 'Tonight' : 'Last night'
+}
+
+function recordRpcError(errors, kind, err) {
+  errors.push({
+    kind,
+    path: null,
+    error: err && err.message ? String(err.message) : String(err || 'request failed'),
+  })
+}
+
 async function loadFromHost() {
-  const win = overnightWindow(new Date())
+  const now = new Date()
+  const win = overnightWindow(now)
+  const errors = []
   let jobs = []
   let sessions = []
   try {
     jobs = jobsFromRpc(await host.request('cron.manage', { action: 'list' }))
-  } catch {
+  } catch (err) {
     jobs = []
+    recordRpcError(errors, 'cron.manage', err)
   }
   try {
     sessions = sessionsFromRpc(await host.request('session.list', { include_hidden: true, limit: 200 }))
-  } catch {
+  } catch (err) {
     sessions = []
+    recordRpcError(errors, 'session.list', err)
   }
   const cronSessions = sessions.filter((s) => {
     const src = String(s.source || '').toLowerCase()
@@ -299,7 +361,6 @@ async function loadFromHost() {
   for (const sess of cronSessions) {
     const jobId = cronSessionJobId(sess)
     const job = byId.get(jobId) || {}
-    const ended = sess.ended_at != null
     raw.push({
       ...sess,
       job_id: jobId || sess.id,
@@ -307,7 +368,7 @@ async function loadFromHost() {
       schedule: scheduleOf(job),
       started_at: sess.started_at,
       finished_at: sess.ended_at,
-      status: ended ? (String(sess.end_reason || '').toLowerCase().includes('fail') || String(sess.end_reason || '').toLowerCase() === 'error' ? 'failed' : 'completed') : 'running',
+      status: sessionStatus(sess),
       session_id: sess.id,
     })
   }
@@ -325,14 +386,37 @@ async function loadFromHost() {
     })
   }
   const runs = filterWindow(mergeRuns(raw), win.start, win.end)
+  const unread = errors.length > 0 && runs.length === 0
+  const partial = errors.length > 0 && runs.length > 0
   return {
-    ok: true,
-    window: { start: win.start.toISOString(), end: win.end.toISOString(), tz: Intl.DateTimeFormat().resolvedOptions().timeZone, label: 'Last night' },
+    ok: errors.length === 0,
+    read_status: unread ? 'unread' : partial ? 'partial' : 'ok',
+    window: {
+      start: win.start.toISOString(),
+      end: win.end.toISOString(),
+      tz: desktopTz(),
+      label: windowLabel(now),
+    },
     summary: summarize(runs),
     runs,
+    errors,
     source: 'rpc',
     degraded: true,
   }
+}
+
+function isUnreadPayload(payload) {
+  if (!payload) return true
+  if (payload.read_status === 'unread') return true
+  if (payload.ok === false && (!payload.runs || payload.runs.length === 0)) return true
+  return false
+}
+
+function hasReadProblems(payload) {
+  if (!payload) return false
+  if (payload.ok === false) return true
+  if (payload.read_status === 'unread' || payload.read_status === 'partial') return true
+  return Array.isArray(payload.errors) && payload.errors.length > 0
 }
 
 async function fetchNight(ctx) {
@@ -343,18 +427,43 @@ async function fetchNight(ctx) {
   } catch (err) {
     rpcErr = err
   }
+  const tz = desktopTz()
+  let rest = null
+  let restErr = null
   try {
-    const rest = await ctx.rest('/night')
-    if (rest && rest.ok !== false && Array.isArray(rest.runs)) {
-      return rest
-    }
-  } catch (restErr) {
-    if (rpc && Array.isArray(rpc.runs)) return rpc
-    throw restErr
+    const qs = tz ? `?tz=${encodeURIComponent(tz)}` : ''
+    rest = await ctx.rest(`/night${qs}`)
+  } catch (err) {
+    restErr = err
   }
-  if (rpc && Array.isArray(rpc.runs)) return rpc
+
+  const restRuns = rest && Array.isArray(rest.runs) ? rest.runs : null
+  const rpcRuns = rpc && Array.isArray(rpc.runs) ? rpc.runs : null
+  const restHasJobs = restRuns && restRuns.length > 0
+  const rpcHasJobs = rpcRuns && rpcRuns.length > 0
+
+  if (restRuns && !isUnreadPayload(rest)) {
+    return rest
+  }
+  // Unread/empty REST must not hide RPC that listed real jobs.
+  if (restRuns && isUnreadPayload(rest) && !restHasJobs && rpcHasJobs) {
+    return {
+      ...rpc,
+      errors: [...(rest.errors || []), ...(rpc.errors || [])],
+    }
+  }
+  if (restRuns) return rest
+  if (rpcRuns) return rpc
+  if (restErr) throw restErr
   if (rpcErr) throw rpcErr
-  return { ok: false, error: 'empty', runs: [], summary: { runs: 0, failed: 0, tokens: null, usd: null } }
+  return {
+    ok: false,
+    error: 'empty',
+    read_status: 'unread',
+    runs: [],
+    errors: [{ kind: 'night', path: null, error: 'empty' }],
+    summary: emptySummary(),
+  }
 }
 
 function fmtUsd(value) {
@@ -411,14 +520,44 @@ function FailChip({ failed }) {
   })
 }
 
+function RunningChip({ running }) {
+  if (!running) return null
+  return jsx('button', {
+    type: 'button',
+    className: 'px-1.5 text-[0.6875rem] text-(--ui-text-secondary)',
+    onClick: () => {
+      haptic('tap')
+      host.navigate(ROUTE)
+    },
+    children: jsxs('span', {
+      className: 'inline-flex items-center gap-1',
+      children: [
+        jsx(StatusDot, { tone: 'muted' }),
+        `${running} running`,
+      ],
+    }),
+  })
+}
+
+function costSummaryText(summary) {
+  const n = summary.runs || 0
+  const billed = typeof summary.usd_billed === 'number' ? summary.usd_billed : null
+  const coverage = summary.cost_coverage
+  if (coverage === 'partial' || (billed != null && n > 0 && billed > 0 && billed < n)) {
+    return `partial (${billed}/${n} billed)`
+  }
+  if (summary.usd != null) return fmtUsd(summary.usd)
+  if (summary.tokens != null) return fmtTokens(summary.tokens)
+  return 'cost unknown'
+}
+
 function SummaryLine({ summary }) {
   const parts = [
     `${summary.runs} run${summary.runs === 1 ? '' : 's'}`,
     `${summary.failed} failed`,
   ]
-  if (summary.usd != null) parts.push(fmtUsd(summary.usd))
-  else if (summary.tokens != null) parts.push(fmtTokens(summary.tokens))
-  else parts.push('cost unknown')
+  if (summary.running) parts.push(`${summary.running} running`)
+  parts.push(costSummaryText(summary))
   return jsx('div', {
     className: 'text-xs text-(--ui-text-tertiary)',
     children: parts.join(' · '),
@@ -469,6 +608,23 @@ function RunRow({ run }) {
   })
 }
 
+function formatReadErrors(data) {
+  const errs = (data && data.errors) || []
+  const lines = errs
+    .map((e) => {
+      if (!e) return ''
+      if (e.path) return `${e.path}: ${e.error || e.kind || 'read failed'}`
+      if (e.kind && e.error) return `${e.kind}: ${e.error}`
+      return e.error || e.kind || ''
+    })
+    .filter(Boolean)
+  if (data && data.error && !lines.length) lines.push(String(data.error))
+  if (!lines.length) {
+    return 'Could not read local cron storage. This is not a quiet night — the ledger was unread.'
+  }
+  return lines.slice(0, 4).join(' · ')
+}
+
 function CronNightPage({ ctx }) {
   const filter = useValue($filter)
   const { data, isLoading, error, refetch, isFetching } = useQuery({
@@ -479,11 +635,13 @@ function CronNightPage({ ctx }) {
     retry: 1,
   })
   const runs = (data && data.runs) || []
-  const summary = (data && data.summary) || { runs: 0, failed: 0, tokens: null, usd: null }
+  const summary = (data && data.summary) || emptySummary()
   const windowInfo = data && data.window
   const visible = filter === 'failed'
     ? runs.filter((r) => r.status === 'failed' || r.status === 'unknown' || r.error)
     : runs
+  const readProblems = hasReadProblems(data)
+  const unread = Boolean(data) && isUnreadPayload(data) && runs.length === 0
 
   if (isLoading) {
     return jsxs('div', {
@@ -495,14 +653,16 @@ function CronNightPage({ ctx }) {
     })
   }
 
-  if (error && !data) {
+  if ((error && !data) || unread || (readProblems && runs.length === 0)) {
     return jsxs('div', {
       className: 'flex h-full flex-col items-center justify-center gap-3 p-8',
       children: [
         jsx(ErrorState, {
-          title: 'Backend not reachable',
+          title: error && !data ? 'Backend not reachable' : 'Could not read last night',
           description:
-            'Enable Cron Night in Settings → Plugins, then quit Hermes Desktop and relaunch from the menu. Reload desktop plugins is JS only. Gateway cron/session RPCs were also unavailable.',
+            error && !data
+              ? 'Enable Cron Night in Settings → Plugins, then quit Hermes Desktop and relaunch from the menu. Reload desktop plugins is JS only. Gateway cron/session RPCs were also unavailable.'
+              : formatReadErrors(data),
         }),
         jsx(Button, { variant: 'ghost', size: 'sm', onClick: () => refetch(), children: 'Retry' }),
       ],
@@ -525,6 +685,12 @@ function CronNightPage({ ctx }) {
             : null,
         ],
       }),
+      readProblems
+        ? jsx('div', {
+            className: 'rounded-md border border-(--ui-stroke-secondary) px-3 py-2 text-xs text-(--ui-text-secondary)',
+            children: formatReadErrors(data),
+          })
+        : null,
       windowInfo
         ? jsx('div', {
             className: 'text-xs text-(--ui-text-tertiary)',
@@ -575,8 +741,10 @@ function FailChipHost({ ctx }) {
     retry: 0,
   })
   const failed = (data && data.summary && data.summary.failed) || 0
-  if (!failed) return null
-  return jsx(FailChip, { failed })
+  const running = (data && data.summary && data.summary.running) || 0
+  if (failed) return jsx(FailChip, { failed })
+  if (running) return jsx(RunningChip, { running })
+  return null
 }
 
 export default {
