@@ -124,7 +124,11 @@ function normalizeCost(payload) {
     else {
       const inp = finiteNumber(payload.input_tokens)
       const out = finiteNumber(payload.output_tokens)
-      if (inp != null || out != null) tokens = Math.trunc((inp || 0) + (out || 0))
+      const cacheR = finiteNumber(payload.cache_read_tokens)
+      const cacheW = finiteNumber(payload.cache_write_tokens)
+      if (inp != null || out != null || cacheR != null || cacheW != null) {
+        tokens = Math.trunc((inp || 0) + (out || 0) + (cacheR || 0) + (cacheW || 0))
+      }
     }
   }
   const status = String(payload.cost_status || payload.costStatus || '').toLowerCase()
@@ -194,6 +198,7 @@ function emptyRun() {
     error: null,
     session_id: null,
     profile: '',
+    home: '',
   }
 }
 
@@ -216,36 +221,49 @@ function toRun(raw) {
   run.error = errorSnippet(raw.error || raw.last_error || raw.last_delivery_error)
   run.session_id = raw.session_id || raw.sessionId || (String(raw.id || '').startsWith('cron_') ? raw.id : null)
   run.profile = String(raw.profile || '')
+  run.home = String(raw.home || '')
   run.id = String(raw.execution_id || raw.id || raw.fire_id || raw.session_id || `${jobId}:${run.started_at || ''}`)
   return run
 }
 
 const MERGE_WINDOW_MS = 120 * 1000
 
+function runTimes(run) {
+  const times = []
+  const started = parseTime(run.started_at)
+  const finished = parseTime(run.finished_at)
+  if (started) times.push(started)
+  if (finished) times.push(finished)
+  return times
+}
+
 function mergeRuns(list) {
   const merged = []
   for (const raw of list) {
     const run = toRun(raw)
-    const started = parseTime(run.started_at)
+    const times = runTimes(run)
     let partner = null
     let partnerDelta = MERGE_WINDOW_MS + 1
     for (const other of merged) {
       if (other.job_id !== run.job_id) continue
-      const otherStarted = parseTime(other.started_at)
-      if (!started && !otherStarted) {
+      const otherTimes = runTimes(other)
+      if (!times.length && !otherTimes.length) {
         partner = other
         partnerDelta = 0
         break
       }
-      if (!started || !otherStarted) continue
-      const delta = Math.abs(started.getTime() - otherStarted.getTime())
-      if (delta <= MERGE_WINDOW_MS && delta < partnerDelta) {
-        partner = other
-        partnerDelta = delta
+      for (const left of times) {
+        for (const right of otherTimes) {
+          const delta = Math.abs(left.getTime() - right.getTime())
+          if (delta <= MERGE_WINDOW_MS && delta < partnerDelta) {
+            partner = other
+            partnerDelta = delta
+          }
+        }
       }
     }
     if (partner) {
-      for (const field of ['id', 'job_id', 'name', 'schedule', 'started_at', 'finished_at', 'session_id', 'profile']) {
+      for (const field of ['id', 'job_id', 'name', 'schedule', 'started_at', 'finished_at', 'session_id', 'profile', 'home']) {
         if (!partner[field] && run[field]) partner[field] = run[field]
       }
       partner.status = preferStatus(partner.status, run.status)
@@ -302,9 +320,23 @@ function summarize(runs) {
   }
 }
 
+function hungIntoWindow(run, start, end) {
+  if (run.status !== 'running' && run.status !== 'claimed') return false
+  const finished = parseTime(run.finished_at)
+  if (finished) return false
+  const started = parseTime(run.started_at)
+  if (!started) return true
+  return started < end
+}
+
 function filterWindow(runs, start, end) {
   return runs
-    .filter((run) => inWindow(parseTime(run.started_at), start, end) || inWindow(parseTime(run.finished_at), start, end))
+    .filter((run) => {
+      if (inWindow(parseTime(run.started_at), start, end) || inWindow(parseTime(run.finished_at), start, end)) {
+        return true
+      }
+      return hungIntoWindow(run, start, end)
+    })
     .sort((a, b) => {
       const ta = parseTime(a.started_at)
       const tb = parseTime(b.started_at)
@@ -358,9 +390,11 @@ async function loadFromHost() {
   })
   const byId = new Map(jobs.map((j) => [String(j.id || ''), j]))
   const raw = []
+  const jobsWithHistory = new Set()
   for (const sess of cronSessions) {
     const jobId = cronSessionJobId(sess)
     const job = byId.get(jobId) || {}
+    if (jobId) jobsWithHistory.add(jobId)
     raw.push({
       ...sess,
       job_id: jobId || sess.id,
@@ -370,10 +404,14 @@ async function loadFromHost() {
       finished_at: sess.ended_at,
       status: sessionStatus(sess),
       session_id: sess.id,
+      profile: 'gateway',
+      home: 'gateway',
     })
   }
   for (const job of jobs) {
     if (!job.last_run_at) continue
+    const jobId = String(job.id || '')
+    if (jobId && jobsWithHistory.has(jobId)) continue
     raw.push({
       id: `last:${job.id}:${job.last_run_at}`,
       job_id: job.id,
@@ -383,6 +421,8 @@ async function loadFromHost() {
       started_at: job.last_run_at,
       status: job.last_status,
       error: job.last_error || job.last_delivery_error,
+      profile: 'gateway',
+      home: 'gateway',
     })
   }
   const runs = filterWindow(mergeRuns(raw), win.start, win.end)
@@ -399,6 +439,7 @@ async function loadFromHost() {
     },
     summary: summarize(runs),
     runs,
+    homes: ['gateway'],
     errors,
     source: 'rpc',
     degraded: true,
@@ -501,6 +542,16 @@ function fmtWhen(iso) {
   return dt.toLocaleString()
 }
 
+function problemRun(run) {
+  return (
+    run.status === 'failed' ||
+    run.status === 'unknown' ||
+    run.status === 'running' ||
+    run.status === 'claimed' ||
+    Boolean(run.error)
+  )
+}
+
 function FailChip({ failed }) {
   if (!failed) return null
   return jsx('button', {
@@ -582,6 +633,9 @@ function RunRow({ run }) {
             className: 'min-w-0 flex-1 truncate text-sm font-medium',
             children: run.name || run.job_id || 'cron',
           }),
+          run.profile
+            ? jsx(Badge, { className: 'shrink-0 text-[0.625rem]', children: run.profile })
+            : null,
           jsx(Badge, { className: 'shrink-0 text-[0.625rem]', children: meta.label }),
         ],
       }),
@@ -637,8 +691,9 @@ function CronNightPage({ ctx }) {
   const runs = (data && data.runs) || []
   const summary = (data && data.summary) || emptySummary()
   const windowInfo = data && data.window
+  const homes = (data && Array.isArray(data.homes) ? data.homes : []).filter(Boolean)
   const visible = filter === 'failed'
-    ? runs.filter((r) => r.status === 'failed' || r.status === 'unknown' || r.error)
+    ? runs.filter(problemRun)
     : runs
   const readProblems = hasReadProblems(data)
   const unread = Boolean(data) && isUnreadPayload(data) && runs.length === 0
@@ -703,6 +758,17 @@ function CronNightPage({ ctx }) {
               (windowInfo.tz ? ' · ' + windowInfo.tz : ''),
           })
         : null,
+      homes.length
+        ? jsx('div', {
+            className: 'text-xs text-(--ui-text-tertiary)',
+            children:
+              (data && data.source === 'rpc'
+                ? 'RPC · connected gateway only · '
+                : homes.length > 1
+                  ? 'Union of homes · '
+                  : 'Home · ') + homes.join(' · '),
+          })
+        : null,
       jsx(SummaryLine, { summary }),
       jsx(SegmentedControl, {
         value: filter,
@@ -715,10 +781,10 @@ function CronNightPage({ ctx }) {
       jsx(Separator, {}),
       visible.length === 0
         ? jsx(EmptyState, {
-            title: filter === 'failed' ? 'No failed runs' : 'Nothing ran last night',
+            title: filter === 'failed' ? 'No failed or hung runs' : 'Nothing ran last night',
             description:
               filter === 'failed'
-                ? 'Last night’s window has no failed or unknown attempts.'
+                ? 'Last night’s window has no failed, unknown, or still-running attempts.'
                 : 'No cron attempts in the overnight window. Jobs still scheduled will show up after they fire.',
           })
         : jsx(ScrollArea, {
@@ -742,9 +808,14 @@ function FailChipHost({ ctx }) {
   })
   const failed = (data && data.summary && data.summary.failed) || 0
   const running = (data && data.summary && data.summary.running) || 0
-  if (failed) return jsx(FailChip, { failed })
-  if (running) return jsx(RunningChip, { running })
-  return null
+  if (!failed && !running) return null
+  return jsxs('span', {
+    className: 'inline-flex items-center',
+    children: [
+      jsx(FailChip, { failed }),
+      jsx(RunningChip, { running }),
+    ],
+  })
 }
 
 export default {

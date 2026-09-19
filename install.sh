@@ -46,6 +46,10 @@ install_into() {
   env -u HERMES_PROFILE HERMES_HOME="$home" "$HERMES_BIN" plugins enable "$NAME" --no-allow-tool-override
 }
 
+# Prefer this checkout's JS. The enable loop used to copy whichever
+# profiles/*/plugins checkout was last in homes[] (divergent versions).
+SELF="$(cd "$(dirname "$0")" && pwd)"
+
 src=""
 for home in "${homes[@]}"; do
   install_into "$home"
@@ -56,6 +60,10 @@ for home in "${homes[@]}"; do
     [[ -f $candidate ]] && src=$candidate
   fi
 done
+
+if [[ -f $SELF/desktop/plugin.js ]]; then
+  src="$SELF/desktop/plugin.js"
+fi
 
 if [[ -z $src ]]; then
   echo "desktop/plugin.js not found" >&2

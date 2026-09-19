@@ -6,10 +6,11 @@ A [Hermes Agent](https://github.com/NousResearch/hermes-agent) desktop plugin th
 
 - **Sidebar** — Cron Night, plus ⌘K → Open Cron Night
 - **Overnight window** — last *local* night in the Desktop timezone (`tz` query param). Before 18:00: yesterday 18:00 → today 08:00. From 18:00 onward: today 18:00 → tomorrow 08:00 (the night that just started). If `tz` is omitted, `/night` uses the serve process local zone (often UTC).
-- **One run list** — name, schedule, times, status, tokens, USD (nullable), error snippet
+- **One run list** — name, schedule, times, status, tokens, USD (nullable), error snippet, **profile** (which Hermes home the row came from)
 - **Summary** — N runs · F failed · cost only when every in-window run has USD; otherwise `partial (k/n billed)` or cost unknown
-- **Filters** — All / Failed
-- **Status bar** — a fail chip when last night had failures; a running chip when in-window jobs are still claimed/running
+- **Filters** — All / Failed (Failed includes unknown and still-running/claimed)
+- **Status bar** — a fail chip when last night had failures; a running chip when in-window (or spillover hung) jobs are still claimed/running. Both can show at once.
+- **Homes** — header lists every Hermes home scanned. Disk unions default + `profiles/*`; RPC fallback is the connected gateway only. The pane says so; it does not silently mix them.
 - **Unread ≠ empty** — disk I/O or parse failures go in `errors[]` with `ok: false` / `read_status: unread|partial`. Empty successful reads stay `ok: true`. The pane shows an error, not “quiet night.”
 - **Degrades** — if `plugin_api.py` is not mounted, Desktop falls back to gateway `cron.manage` + `session.list`. Missing cost stays `null` — it is never invented.
 
@@ -72,11 +73,11 @@ smf-cron-night/
 
 | Path | What we take |
 |------|----------------|
-| `cron/jobs.json` | name, `schedule` / `schedule_display`, `last_run_at`, `last_status`, `last_error` |
+| `cron/jobs.json` | name, `schedule` / `schedule_display`; `last_run_at` only when that job has no executions / output / audit / session rows |
 | `cron/executions.db` | attempt ledger: `claimed` → `running` → `completed` \| `failed` \| `unknown` |
-| `cron/usage_audit.jsonl` | `prompt_tokens` / `completion_tokens` / `total_tokens` (no USD) |
+| `cron/usage_audit.jsonl` | `prompt_tokens` / `completion_tokens` / `total_tokens` (no USD). A clean audit line does not paint `completed`. |
 | `cron/output/{job_id}/{timestamp}.md` | output + error snippet; `{timestamp}.audit.json` when present |
-| `state.db` sessions `source=cron` | `cron_{job_id}_{timestamp}` rows; `actual_cost_usd` / `estimated_cost_usd` only if stored |
+| `state.db` sessions `source=cron` | `cron_{job_id}_{timestamp}` rows; `actual_cost_usd` / `estimated_cost_usd` only if stored. Newest 500 by `started_at`. |
 
 USD is copied from recorded session billing columns. Token rows without a stored dollar amount stay `usd: null`.
 
