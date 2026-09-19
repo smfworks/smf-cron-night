@@ -1,0 +1,5 @@
+name: smf-cron-night
+version: "1.0"
+description: Hermes Desktop pane — what ran last night, what failed, and what each run cost.
+author: SMF Works
+kind: standalone

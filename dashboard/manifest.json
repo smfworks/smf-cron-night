@@ -1,0 +1,12 @@
+{
+  "name": "smf-cron-night",
+  "label": "Cron Night",
+  "description": "What ran last night, what failed, and what each run cost — one list.",
+  "icon": "Clock",
+  "version": "1.0.0",
+  "tab": {
+    "path": "/cron-night",
+    "position": "after:artifacts"
+  },
+  "api": "plugin_api.py"
+}
