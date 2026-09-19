@@ -336,24 +336,25 @@ async function loadFromHost() {
 }
 
 async function fetchNight(ctx) {
-  let rest = null
-  let restErr = null
+  let rpc = null
+  let rpcErr = null
   try {
-    rest = await ctx.rest('/night')
+    rpc = await loadFromHost()
   } catch (err) {
-    restErr = err
-  }
-  if (rest && rest.ok !== false && Array.isArray(rest.runs)) {
-    return rest
+    rpcErr = err
   }
   try {
-    const rpc = await loadFromHost()
-    if (rpc.runs.length || !restErr) return rpc
-  } catch {
-    /* fall through */
+    const rest = await ctx.rest('/night')
+    if (rest && rest.ok !== false && Array.isArray(rest.runs)) {
+      return rest
+    }
+  } catch (restErr) {
+    if (rpc && Array.isArray(rpc.runs)) return rpc
+    throw restErr
   }
-  if (restErr) throw restErr
-  return rest || { ok: false, error: 'empty', runs: [], summary: { runs: 0, failed: 0, tokens: null, usd: null } }
+  if (rpc && Array.isArray(rpc.runs)) return rpc
+  if (rpcErr) throw rpcErr
+  return { ok: false, error: 'empty', runs: [], summary: { runs: 0, failed: 0, tokens: null, usd: null } }
 }
 
 function fmtUsd(value) {
