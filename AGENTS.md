@@ -18,4 +18,4 @@ For Hermes/OpenClaw installing this repo on a user's machine.
 
 ## After relaunch
 
-Sidebar **Cron Night**, or ⌘K → Open Cron Night. Optional status-bar chip appears only when last night had failures.
+Sidebar **Cron Night**, or ⌘K → Open Cron Night. Optional status-bar chip appears when last night had failures, or when in-window jobs are still running. Unreadable cron storage is an error, not a quiet night.

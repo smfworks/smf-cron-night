@@ -5,11 +5,12 @@ A [Hermes Agent](https://github.com/NousResearch/hermes-agent) desktop plugin th
 ## What it does
 
 - **Sidebar** — Cron Night, plus ⌘K → Open Cron Night
-- **Overnight window** — last local night (18:00 yesterday → 08:00 today in the machine TZ)
+- **Overnight window** — last *local* night in the Desktop timezone (`tz` query param). Before 18:00: yesterday 18:00 → today 08:00. From 18:00 onward: today 18:00 → tomorrow 08:00 (the night that just started). If `tz` is omitted, `/night` uses the serve process local zone (often UTC).
 - **One run list** — name, schedule, times, status, tokens, USD (nullable), error snippet
-- **Summary** — N runs · F failed · total cost (sum of recorded USD only)
+- **Summary** — N runs · F failed · cost only when every in-window run has USD; otherwise `partial (k/n billed)` or cost unknown
 - **Filters** — All / Failed
-- **Status bar** — a fail chip only when last night had failures
+- **Status bar** — a fail chip when last night had failures; a running chip when in-window jobs are still claimed/running
+- **Unread ≠ empty** — disk I/O or parse failures go in `errors[]` with `ok: false` / `read_status: unread|partial`. Empty successful reads stay `ok: true`. The pane shows an error, not “quiet night.”
 - **Degrades** — if `plugin_api.py` is not mounted, Desktop falls back to gateway `cron.manage` + `session.list`. Missing cost stays `null` — it is never invented.
 
 ## Install
@@ -81,10 +82,12 @@ USD is copied from recorded session billing columns. Token rows without a stored
 
 Desktop also tries gateway JSON-RPC (`host.request('cron.manage', {action:'list'})` and `host.request('session.list', {include_hidden:true})`) when the plugin backend is off.
 
+`GET /night?tz=<IANA>` — Desktop sends `Intl.DateTimeFormat().resolvedOptions().timeZone`. Window bounds use that zone. **Default if omitted:** serve process local timezone (`datetime.now().astimezone()`), which is often UTC on a systemd gateway.
+
 ## Tests
 
 ```bash
-python -m pytest tests/test_plugin_api.py -q
+python3 -m pytest tests/ -q
 ```
 
 ## License

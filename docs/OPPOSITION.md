@@ -13,6 +13,25 @@ the trust breakers below.
 
 ---
 
+## Addressed in Honest night
+
+Follow-up PR (this tree after `760ca41` / opposition `c9a4add`): window, timezone,
+unread vs empty, and the cheap honesty wins. **Not a full cost redesign or
+profile ACL.**
+
+| Item | What changed |
+|------|----------------|
+| **P0.1** unread vs empty | Disk I/O/parse failures go in `errors[]` with `ok: false` and `read_status: unread\|partial`. Empty successful read stays `ok: true`. Desktop `ErrorState` / banner — never “Nothing ran last night.” REST unread empty no longer hides RPC that listed jobs. Fail chip may stay off on unread. |
+| **P0.2** 18:00 window | If local now ≥ 18:00, window is *today* 18:00 → *tomorrow* 08:00. Before 18:00: yesterday 18:00 → today 08:00. Same in Python `overnight_window` and JS `overnightWindow`. |
+| **P0.3** serve TZ vs Desktop | `fetchNight` always sends `?tz=` from `Intl` / `resolvedOptions().timeZone`. `plugin_api.py` honors it for bounds. Omitted/invalid `tz` → serve process local zone (documented). |
+| **P0.4** (cheap) unknown vs ok | Missing / unmapped `end_reason` → `unknown`. Unaudited markdown without `(FAILED)` → `unknown`, not `completed`. |
+| **P0.5** (cheap) partial USD | Summary omits `usd` when coverage is incomplete and labels `partial (k/n billed)`. Bare `$` total only when every in-window run has USD. |
+| Status-bar running | Chip for in-window `running`/`claimed` when there are no failures. |
+
+Still open: full P0.5 cost merge/estimate redesign, P0.6 profile isolation, dual-aggregator rewrite, CI.
+
+---
+
 ## 1. Executive opposition
 
 I would not trust this pane for a Spark morning. It can render **“Nothing ran last

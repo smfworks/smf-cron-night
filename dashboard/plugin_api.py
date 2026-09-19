@@ -11,6 +11,14 @@ and ``~/.hermes/profiles/<name>``):
 * ``state.db`` sessions with ``source='cron'`` — tokens and recorded USD
 
 Never invents a dollar amount. Tokens and USD are nullable.
+
+``GET /night`` query params:
+
+* ``tz`` — IANA name from Desktop (``Intl.DateTimeFormat().resolvedOptions().timeZone``).
+  Window bounds are computed in this zone. If omitted or invalid, the serve
+  process local timezone is used (``datetime.now().astimezone()``, often UTC
+  on a systemd gateway).
+* ``start`` / ``end`` — optional explicit ISO-8601 bounds.
 """
 from __future__ import annotations
 
@@ -107,23 +115,52 @@ def overnight_window(
     now: Optional[datetime] = None,
     tz: Optional[tzinfo] = None,
 ) -> Tuple[datetime, datetime]:
-    """Last local overnight: previous 18:00 → following 08:00.
+    """Local overnight window: 18:00 → following 08:00.
 
-    At 15:00 Tuesday this is Monday 18:00 → Tuesday 08:00.
-    At 03:00 Tuesday this is still Monday 18:00 → Tuesday 08:00 (in progress).
+    * After 18:00 (inclusive): *today* 18:00 → *tomorrow* 08:00 (the night
+      that just started).
+    * Before 18:00: *yesterday* 18:00 → *today* 08:00 (in progress before
+      08:00; last closed night from 08:00 until 18:00).
     """
     zone = tz or resolve_tz()
     current = now.astimezone(zone) if now is not None else datetime.now(zone)
     today = current.date()
+    evening = datetime.combine(today, OVERNIGHT_START, tzinfo=zone)
     morning = datetime.combine(today, OVERNIGHT_END, tzinfo=zone)
-    if current < morning:
-        end = morning
-        start = datetime.combine(today - timedelta(days=1), OVERNIGHT_START, tzinfo=zone)
+    if current >= evening:
+        start = evening
+        end = datetime.combine(today + timedelta(days=1), OVERNIGHT_END, tzinfo=zone)
     else:
         start = datetime.combine(today - timedelta(days=1), OVERNIGHT_START, tzinfo=zone)
         end = morning
-        # After 08:00, last night already ended at this morning.
     return start, end
+
+
+def overnight_label(now: datetime, tz: tzinfo) -> str:
+    """'Tonight' after local 18:00; otherwise 'Last night'."""
+    current = now.astimezone(tz)
+    evening = datetime.combine(current.date(), OVERNIGHT_START, tzinfo=tz)
+    return "Tonight" if current >= evening else "Last night"
+
+
+def _record_error(
+    errors: Optional[List[Dict[str, Any]]],
+    *,
+    kind: str,
+    path: Any,
+    error: Any,
+    home: Optional[str] = None,
+) -> None:
+    if errors is None:
+        return
+    rec: Dict[str, Any] = {
+        "kind": kind,
+        "path": str(path) if path is not None else None,
+        "error": str(error),
+    }
+    if home:
+        rec["home"] = home
+    errors.append(rec)
 
 
 def in_window(dt: Optional[datetime], start: datetime, end: datetime) -> bool:
@@ -365,12 +402,16 @@ def discover_hermes_homes(root: Optional[Path] = None) -> List[Path]:
     return found
 
 
-def load_jobs_file(path: Path) -> List[Dict[str, Any]]:
+def load_jobs_file(
+    path: Path,
+    errors: Optional[List[Dict[str, Any]]] = None,
+) -> List[Dict[str, Any]]:
     if not path.is_file():
         return []
     try:
         raw = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError, UnicodeDecodeError):
+    except (OSError, json.JSONDecodeError, UnicodeDecodeError) as exc:
+        _record_error(errors, kind="jobs.json", path=path, error=exc)
         return []
     if isinstance(raw, list):
         jobs = raw
@@ -379,11 +420,15 @@ def load_jobs_file(path: Path) -> List[Dict[str, Any]]:
         if isinstance(jobs, dict):
             jobs = [{**v, "id": v.get("id") or k} for k, v in jobs.items() if isinstance(v, dict)]
     else:
+        _record_error(errors, kind="jobs.json", path=path, error="jobs.json is not a list or object")
         return []
     return [j for j in jobs if isinstance(j, dict)]
 
 
-def load_usage_audit(path: Path) -> List[Dict[str, Any]]:
+def load_usage_audit(
+    path: Path,
+    errors: Optional[List[Dict[str, Any]]] = None,
+) -> List[Dict[str, Any]]:
     if not path.is_file():
         return []
     rows: List[Dict[str, Any]] = []
@@ -399,17 +444,22 @@ def load_usage_audit(path: Path) -> List[Dict[str, Any]]:
                     continue
                 if isinstance(rec, dict):
                     rows.append(rec)
-    except OSError:
+    except OSError as exc:
+        _record_error(errors, kind="usage_audit.jsonl", path=path, error=exc)
         return []
     return rows
 
 
-def load_executions_db(path: Path) -> List[Dict[str, Any]]:
+def load_executions_db(
+    path: Path,
+    errors: Optional[List[Dict[str, Any]]] = None,
+) -> List[Dict[str, Any]]:
     if not path.is_file():
         return []
     try:
         conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
-    except sqlite3.Error:
+    except sqlite3.Error as exc:
+        _record_error(errors, kind="executions.db", path=path, error=exc)
         return []
     conn.row_factory = sqlite3.Row
     try:
@@ -417,7 +467,8 @@ def load_executions_db(path: Path) -> List[Dict[str, Any]]:
             rows = conn.execute(
                 "SELECT * FROM executions ORDER BY claimed_at DESC, id DESC LIMIT 500"
             ).fetchall()
-        except sqlite3.Error:
+        except sqlite3.Error as exc:
+            _record_error(errors, kind="executions.db", path=path, error=exc)
             return []
         return [dict(row) for row in rows]
     finally:
@@ -438,17 +489,27 @@ def _session_columns(conn: sqlite3.Connection) -> set[str]:
     return names
 
 
-def load_cron_sessions(path: Path) -> List[Dict[str, Any]]:
+def load_cron_sessions(
+    path: Path,
+    errors: Optional[List[Dict[str, Any]]] = None,
+) -> List[Dict[str, Any]]:
     if not path.is_file():
         return []
     try:
         conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
-    except sqlite3.Error:
+    except sqlite3.Error as exc:
+        _record_error(errors, kind="state.db", path=path, error=exc)
         return []
     conn.row_factory = sqlite3.Row
     try:
         cols = _session_columns(conn)
         if "source" not in cols or "id" not in cols:
+            _record_error(
+                errors,
+                kind="state.db",
+                path=path,
+                error="sessions table missing source/id columns",
+            )
             return []
         want = [
             c for c in (
@@ -463,27 +524,34 @@ def load_cron_sessions(path: Path) -> List[Dict[str, Any]]:
         sql = f"SELECT {', '.join(want)} FROM sessions WHERE source = ? LIMIT 500"
         try:
             rows = conn.execute(sql, ("cron",)).fetchall()
-        except sqlite3.Error:
+        except sqlite3.Error as exc:
+            _record_error(errors, kind="state.db", path=path, error=exc)
             return []
         return [dict(row) for row in rows]
     finally:
         conn.close()
 
 
-def load_output_runs(output_dir: Path, default_tz: tzinfo) -> List[Dict[str, Any]]:
+def load_output_runs(
+    output_dir: Path,
+    default_tz: tzinfo,
+    errors: Optional[List[Dict[str, Any]]] = None,
+) -> List[Dict[str, Any]]:
     if not output_dir.is_dir():
         return []
     runs: List[Dict[str, Any]] = []
     try:
         job_dirs = list(output_dir.iterdir())
-    except OSError:
+    except OSError as exc:
+        _record_error(errors, kind="output", path=output_dir, error=exc)
         return []
     for job_dir in job_dirs:
         if not job_dir.is_dir() or job_dir.name.startswith("."):
             continue
         try:
             files = list(job_dir.iterdir())
-        except OSError:
+        except OSError as exc:
+            _record_error(errors, kind="output", path=job_dir, error=exc)
             continue
         for path in files:
             stem = path.stem
@@ -507,7 +575,8 @@ def load_output_runs(output_dir: Path, default_tz: tzinfo) -> List[Dict[str, Any
             if audit_path.is_file():
                 try:
                     audit = json.loads(audit_path.read_text(encoding="utf-8"))
-                except (OSError, json.JSONDecodeError, UnicodeDecodeError):
+                except (OSError, json.JSONDecodeError, UnicodeDecodeError) as exc:
+                    _record_error(errors, kind="output", path=audit_path, error=exc)
                     audit = None
                 if isinstance(audit, dict):
                     rec["audit"] = audit
@@ -525,12 +594,15 @@ def load_output_runs(output_dir: Path, default_tz: tzinfo) -> List[Dict[str, Any
             if path.suffix == ".md":
                 try:
                     md = path.read_text(encoding="utf-8", errors="replace")
-                except OSError:
+                except OSError as exc:
+                    _record_error(errors, kind="output", path=path, error=exc)
                     md = ""
                 if rec.get("error") is None:
                     rec["error"] = _error_from_markdown(md)
                 if rec.get("status") is None:
-                    rec["status"] = "failed" if "(FAILED)" in md or rec.get("error") else "completed"
+                    # Unaudited markdown is not proof of success.
+                    failed = "(failed)" in md.lower() or bool(rec.get("error"))
+                    rec["status"] = "failed" if failed else "unknown"
             runs.append(rec)
     return runs
 
@@ -670,12 +742,23 @@ def normalize_run(raw: Dict[str, Any], *, default_tz: tzinfo) -> Dict[str, Any]:
     return run
 
 
-def collect_home_runs(home: Path, *, default_tz: tzinfo, profile: str) -> List[Dict[str, Any]]:
+def collect_home_runs(
+    home: Path,
+    *,
+    default_tz: tzinfo,
+    profile: str,
+    errors: Optional[List[Dict[str, Any]]] = None,
+) -> List[Dict[str, Any]]:
     cron_dir = home / "cron"
-    jobs = {str(j.get("id") or ""): j for j in load_jobs_file(cron_dir / "jobs.json") if j.get("id")}
+    jobs = {
+        str(j.get("id") or ""): j
+        for j in load_jobs_file(cron_dir / "jobs.json", errors=errors)
+        if j.get("id")
+    }
     raw_rows: List[Dict[str, Any]] = []
+    home_label = str(home)
 
-    for exe in load_executions_db(cron_dir / "executions.db"):
+    for exe in load_executions_db(cron_dir / "executions.db", errors=errors):
         job = jobs.get(str(exe.get("job_id") or ""), {})
         raw_rows.append({
             **exe,
@@ -683,10 +766,10 @@ def collect_home_runs(home: Path, *, default_tz: tzinfo, profile: str) -> List[D
             "name": job.get("name") or exe.get("job_id"),
             "schedule": schedule_display(job),
             "profile": profile,
-            "home": str(home),
+            "home": home_label,
         })
 
-    for rec in load_output_runs(cron_dir / "output", default_tz):
+    for rec in load_output_runs(cron_dir / "output", default_tz, errors=errors):
         job = jobs.get(str(rec.get("job_id") or ""), {})
         merged = {
             **rec,
@@ -696,7 +779,7 @@ def collect_home_runs(home: Path, *, default_tz: tzinfo, profile: str) -> List[D
         }
         raw_rows.append(merged)
 
-    for rec in load_usage_audit(cron_dir / "usage_audit.jsonl"):
+    for rec in load_usage_audit(cron_dir / "usage_audit.jsonl", errors=errors):
         job = jobs.get(str(rec.get("job_id") or ""), {})
         raw_rows.append({
             **rec,
@@ -708,7 +791,7 @@ def collect_home_runs(home: Path, *, default_tz: tzinfo, profile: str) -> List[D
             "id": rec.get("fire_id"),
         })
 
-    for sess in load_cron_sessions(home / "state.db"):
+    for sess in load_cron_sessions(home / "state.db", errors=errors):
         sid = str(sess.get("id") or "")
         m = CRON_SESSION_RE.match(sid)
         job_id = m.group(1) if m else ""
@@ -717,8 +800,15 @@ def collect_home_runs(home: Path, *, default_tz: tzinfo, profile: str) -> List[D
         ended = sess.get("ended_at")
         status = None
         if ended:
-            reason = str(sess.get("end_reason") or "").lower()
-            status = "failed" if reason in {"error", "failed", "fail"} else "completed"
+            reason = str(sess.get("end_reason") or "").strip()
+            mapped = normalize_status(reason) if reason else None
+            if mapped == "failed":
+                status = "failed"
+            elif mapped == "completed":
+                status = "completed"
+            else:
+                # Missing or unmapped end_reason (timeout, cancelled, killed, …).
+                status = "unknown"
         elif started:
             status = "running"
         raw_rows.append({
@@ -783,16 +873,19 @@ def filter_runs_in_window(
 
 def summarize_runs(runs: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
     failed = 0
+    running = 0
     token_sum = 0
     token_any = False
     usd_sum = 0.0
-    usd_any = False
+    usd_billed = 0
     for run in runs:
         status = run.get("status")
         if status in _TERMINAL_FAILED or status == "failed":
             failed += 1
         elif status is None and run.get("error"):
             failed += 1
+        if status in ("running", "claimed"):
+            running += 1
         tokens = run.get("tokens")
         if isinstance(tokens, int):
             token_sum += tokens
@@ -800,12 +893,27 @@ def summarize_runs(runs: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
         usd = run.get("usd")
         if isinstance(usd, (int, float)) and usd == usd:  # noqa: PLR0124
             usd_sum += float(usd)
-            usd_any = True
+            usd_billed += 1
+    n = len(runs)
+    if usd_billed == 0:
+        coverage = "none"
+        usd_total: Optional[float] = None
+    elif usd_billed == n:
+        coverage = "complete"
+        usd_total = round(usd_sum, 6)
+    else:
+        # Partial sum is not the night's bill — omit usd so consumers cannot
+        # present it as a total.
+        coverage = "partial"
+        usd_total = None
     return {
-        "runs": len(runs),
+        "runs": n,
         "failed": failed,
+        "running": running,
         "tokens": token_sum if token_any else None,
-        "usd": round(usd_sum, 6) if usd_any else None,
+        "usd": usd_total,
+        "usd_billed": usd_billed,
+        "cost_coverage": coverage,
     }
 
 
@@ -815,10 +923,12 @@ def night_payload(
     end: Optional[datetime] = None,
     tz_name: Optional[str] = None,
     root: Optional[Path] = None,
+    now: Optional[datetime] = None,
 ) -> Dict[str, Any]:
     zone = resolve_tz(tz_name)
+    as_of = now.astimezone(zone) if now is not None else datetime.now(zone)
     if start is None or end is None:
-        win_start, win_end = overnight_window(tz=zone)
+        win_start, win_end = overnight_window(now=as_of, tz=zone)
         start = start or win_start
         end = end or win_end
     default_home = Path(root) if root is not None else Path.home() / ".hermes"
@@ -828,25 +938,40 @@ def night_payload(
 
     all_runs: List[Dict[str, Any]] = []
     home_labels: List[str] = []
+    errors: List[Dict[str, Any]] = []
     for home in homes:
         profile = _profile_name(home, default_home)
         home_labels.append(profile)
-        all_runs.extend(collect_home_runs(home, default_tz=zone, profile=profile))
+        before = len(errors)
+        all_runs.extend(
+            collect_home_runs(home, default_tz=zone, profile=profile, errors=errors)
+        )
+        for rec in errors[before:]:
+            rec.setdefault("home", profile)
 
     windowed = filter_runs_in_window(all_runs, start, end, default_tz=zone)
     summary = summarize_runs(windowed)
+    if errors:
+        read_status = "partial" if windowed else "unread"
+        ok = False
+    else:
+        read_status = "ok"
+        ok = True
+    tz_label = getattr(zone, "key", None) or str(zone)
     return {
-        "ok": True,
+        "ok": ok,
         "plugin": PLUGIN,
+        "read_status": read_status,
         "window": {
             "start": start.isoformat(),
             "end": end.isoformat(),
-            "tz": getattr(zone, "key", None) or str(zone),
-            "label": "Last night",
+            "tz": tz_label,
+            "label": overnight_label(as_of, zone),
         },
         "summary": summary,
         "runs": windowed,
         "homes": home_labels,
+        "errors": errors,
         "source": "disk",
         "degraded": False,
     }
@@ -866,13 +991,31 @@ if router is not None:
         end: Optional[str] = None,
         tz: Optional[str] = None,
     ):
+        """Overnight cron runs for the Desktop pane.
+
+        ``tz`` should be the Desktop IANA zone (``Intl`` resolvedOptions).
+        If omitted or invalid, window bounds use the serve process local
+        timezone (often UTC).
+        """
         zone = resolve_tz(tz)
         start_dt = parse_datetime(start, default_tz=zone) if start else None
         end_dt = parse_datetime(end, default_tz=zone) if end else None
         try:
             payload = night_payload(start=start_dt, end=end_dt, tz_name=tz)
         except Exception as exc:  # pragma: no cover - defensive mount
-            return _json({"ok": False, "error": str(exc), "plugin": PLUGIN}, status=200)
+            return _json({
+                "ok": False,
+                "error": str(exc),
+                "plugin": PLUGIN,
+                "read_status": "unread",
+                "errors": [{"kind": "night", "path": None, "error": str(exc)}],
+                "runs": [],
+                "summary": {
+                    "runs": 0, "failed": 0, "running": 0,
+                    "tokens": None, "usd": None, "usd_billed": 0,
+                    "cost_coverage": "none",
+                },
+            }, status=200)
         return _json(payload)
 
     @router.get("/health")
