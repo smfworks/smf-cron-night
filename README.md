@@ -2,6 +2,12 @@
 
 A [Hermes Agent](https://github.com/NousResearch/hermes-agent) desktop plugin that answers **what ran last night, what failed, and what each run cost** in one list. Today that lives in three places (`hermes cron list` / `hermes cron runs`, cron session rows, usage audit). This is one pane. Do not treat the pane as overnight-ops truth yet — read [docs/OPPOSITION.md](docs/OPPOSITION.md).
 
+## Demo
+
+Cron Night in Hermes Desktop (mikesai6) — overnight runs / failures / cost in one pane (honest empty night + RPC fallback when the plugin backend isn’t mounted).
+
+https://github.com/smfworks/smf-cron-night/releases/download/demo/demo.mp4
+
 ## What it does
 
 - **Sidebar** — Cron Night, plus ⌘K → Open Cron Night
